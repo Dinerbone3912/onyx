@@ -17,6 +17,7 @@ from onyx.cache.factory import get_cache_backend
 from onyx.cache.interface import CacheBackend
 from onyx.db.engine.sql_engine import get_session_with_tenant
 from onyx.db.fleet_telemetry import (
+    ERROR_SAMPLE_CHARS,
     ROW_LIMIT,
     attempt_rows,
     connector_rows,
@@ -50,10 +51,11 @@ _INVENTORY_SECONDS: int = 6 * 3600
 # Where the next run starts reading.
 _CURSOR_KEY: str = "fleet_telemetry_cursor"
 _INVENTORY_KEY: str = "fleet_telemetry_inventory"
-# Finished attempts that ended longer ago are not sent. The service rejects attempt
-# events more than 190 days old, also when it processes them days after receipt,
-# and it deletes attempt states after six months. Do not raise this toward either.
-_ATTEMPT_HORIZON: timedelta = timedelta(days=180)
+# Finished attempts and jobs that ended longer ago are not sent. The service rejects
+# attempt and job events more than 190 days old, also when it processes them days
+# after receipt, and it deletes their states after six months. Do not raise this
+# toward either.
+_FINISHED_HORIZON: timedelta = timedelta(days=180)
 # Connector configuration lists that select what to index. Only their sizes leave.
 _SELECTION_LISTS: tuple[str, ...] = (
     "folder_ids",
@@ -110,8 +112,8 @@ def _iso(value: object) -> str | None:
 def classify_local_error(*samples: object) -> str:
     """Examine bounded local samples; emit only a fixed category, never text."""
     candidate: str = " ".join(
-        sample[:2048] for sample in samples if isinstance(sample, str)
-    )[:6144]
+        sample[:ERROR_SAMPLE_CHARS] for sample in samples if isinstance(sample, str)
+    )[: 3 * ERROR_SAMPLE_CHARS]
     for category, pattern in _ERROR_PATTERNS:
         if re.search(pattern, candidate, re.IGNORECASE):
             return category
@@ -232,6 +234,10 @@ def job_data(row: dict[str, Any]) -> dict[str, Any]:
         if row[key] is not None:
             data[key] = _iso(row[key])
     data["error_count"] = max(row["error_count"], int(row["state"] == "failed"))
+    # Only a failed run's message says why it failed. A canceled run's message names
+    # its internal cause, and a partial doc sync has none.
+    if row["state"] == "failed" and row["error_sample"] is not None:
+        data["error_code"] = classify_local_error(row["error_sample"])
     if row["started_at"] and row["ended_at"]:
         data["duration_ms"] = max(
             0, (row["ended_at"] - row["started_at"]).total_seconds() * 1000
@@ -322,18 +328,65 @@ def _send_attempt(
         return _send(
             sender, tenant_id, "attempt", attempt_data(row), entity, row["time_updated"]
         )
-    end: datetime = row["ended_at"]
-    if end < datetime.now(timezone.utc) - _ATTEMPT_HORIZON:
-        # An old attempt that a bulk update touched.
-        return True
-    return _send(
+    return _send_finished(
         sender,
         tenant_id,
         "attempt",
         attempt_data(row),
         entity,
-        end,
+        row["ended_at"],
         revision=1 + (row["completed_batches"] or 0),
+    )
+
+
+def _send_finished(
+    sender: BoundedTelemetry,
+    tenant_id: str,
+    event_type: str,
+    data: dict[str, Any],
+    entity: str,
+    end: datetime,
+    revision: int,
+) -> bool:
+    """Queue a finished attempt or job at its end. One that ended before the horizon,
+    which a later update touched, counts as handled: the service would reject it or
+    soon delete it."""
+    if end < datetime.now(timezone.utc) - _FINISHED_HORIZON:
+        return True
+    return _send(sender, tenant_id, event_type, data, entity, end, revision=revision)
+
+
+def _send_job(
+    sender: BoundedTelemetry, tenant_id: str, row: dict[str, Any], started: datetime
+) -> bool:
+    """A running job goes out at each pass, at revision 0 and at the pass time, so
+    its latest counters replace those of an earlier pass, even when its row time is
+    from another host's clock or its transaction committed late. A finished job goes
+    out at its end, at revision 1:
+
+    - Later passes repeat its event ID, revision, and time, so the service keeps
+      that state.
+    - A later write of a final status stamps a new end. That send goes out at the
+      new end, at the same revision, and the service takes it when the end is later.
+    - The service orders the states of a job by revision, then by time, so the
+      finished state replaces the running one even when it ended before the last
+      running pass. Jobs that end in the same pass keep their own end times.
+    - No other later change gets to the service. The event ID comes from the end,
+      not the data, so a write that changes a finished row without stamping a new
+      end repeats the ID, and the service drops it."""
+    end: datetime | None = row["ended_at"]
+    if end is None:
+        return _send(
+            sender,
+            tenant_id,
+            "job",
+            job_data(row),
+            row["job_id"],
+            row["revision_at"],
+            max(row["revision_at"], started),
+        )
+    return _send_finished(
+        sender, tenant_id, "job", job_data(row), row["job_id"], end, revision=1
     )
 
 
@@ -470,25 +523,14 @@ def collect_snapshots(tenant_id: str) -> None:
                 ),
             ),
         ]
-        # Each job table is a separate capped read. A job event is never older than
-        # its pass, so a finished job replaces the running state that an earlier
-        # pass sent, even when the row time is from another host's clock or its
-        # transaction committed late.
+        # Each job table is a separate capped read.
         for _, table in groupby(jobs, key=lambda row: row["job_id"].split(":")[0]):
             resume.append(
                 _send_in_order(
                     since,
                     list(table),
                     "revision_at",
-                    lambda row: _send(
-                        sender,
-                        tenant_id,
-                        "job",
-                        job_data(row),
-                        row["job_id"],
-                        row["revision_at"],
-                        max(row["revision_at"], started),
-                    ),
+                    lambda row: _send_job(sender, tenant_id, row, started),
                 ),
             )
         # Work goes first, so a large inventory cannot hold it back.
